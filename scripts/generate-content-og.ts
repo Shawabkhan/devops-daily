@@ -2,7 +2,6 @@
 
 import fs from 'fs/promises';
 import path from 'path';
-import { Resvg } from '@resvg/resvg-js';
 import sharp from 'sharp';
 import { getAllPosts } from '../lib/posts.js';
 import { getAllGuides } from '../lib/guides.js';
@@ -15,7 +14,13 @@ import {
   buildContentCoverSvg,
   cleanOgText,
   CONTENT_COVER_TYPES,
+  COVER_HEIGHT,
+  COVER_WIDTH,
+  coverTypeLabel,
   layoutContentCoverTitle,
+  renderContentCoverJpeg,
+  renderCoverOverlay,
+  selectCoverBackground,
   type ContentCoverType,
 } from './og-utils.js';
 
@@ -23,7 +28,12 @@ interface CoverItem {
   type: ContentCoverType;
   slug: string;
   title: string;
+  /** Shown in the category pill. */
   category: string;
+  /** Category and tags used to pick the background illustration. */
+  topicCategory?: string;
+  tags?: unknown[];
+  typeLabel?: string;
   directory: string;
   ogSuffix: boolean;
 }
@@ -33,7 +43,7 @@ interface JsonContentRecord {
   slug?: string;
   title?: string;
   category?: string;
-  difficulty?: string;
+  tags?: unknown[];
   toolA?: { name?: string };
   toolB?: { name?: string };
 }
@@ -42,6 +52,20 @@ const root = process.cwd();
 const force = process.argv.includes('--force');
 const preview = process.argv.includes('--preview');
 const check = process.argv.includes('--check');
+// --migrate replaces covers that are still PNG; --limit=N caps one run so the
+// migration can go in small batches.
+const migrate = process.argv.includes('--migrate');
+function numericFlag(name: string, fallback: number): number {
+  const argument = process.argv.find((value) => value.startsWith(`--${name}=`));
+  const value = argument ? Number(argument.slice(name.length + 3)) : fallback;
+  if (!Number.isInteger(value) || value < 1) throw new Error(`Invalid --${name}`);
+  return value;
+}
+const limit = numericFlag('limit', Number.MAX_SAFE_INTEGER);
+// One cover at a time by default: rendering is CPU-bound and this also runs
+// on small machines. CI can pass --workers=4.
+const workers = numericFlag('workers', 1);
+sharp.concurrency(workers);
 const onlyKeys = new Set(
   process.argv
     .filter((argument) => argument.startsWith('--only='))
@@ -81,6 +105,8 @@ async function collectItems(): Promise<CoverItem[]> {
       slug: post.slug,
       title: post.title,
       category: post.category?.name || 'DevOps',
+      topicCategory: post.category?.slug || post.category?.name,
+      tags: post.tags,
       directory: 'posts',
       ogSuffix: false,
     });
@@ -90,7 +116,9 @@ async function collectItems(): Promise<CoverItem[]> {
       type: 'guide',
       slug: guide.slug,
       title: guide.title,
-      category: guide.category?.name || 'Guide',
+      category: guide.category?.name || 'DevOps',
+      topicCategory: guide.category?.slug || guide.category?.name,
+      tags: guide.tags,
       directory: 'guides',
       ogSuffix: false,
     });
@@ -100,7 +128,9 @@ async function collectItems(): Promise<CoverItem[]> {
       type: 'exercise',
       slug: exercise.id,
       title: exercise.title,
-      category: exercise.category?.name || 'Exercise',
+      category: exercise.category?.name || 'DevOps',
+      topicCategory: exercise.category?.slug || exercise.category?.name,
+      tags: exercise.tags,
       directory: 'exercises',
       ogSuffix: false,
     });
@@ -120,7 +150,10 @@ async function collectItems(): Promise<CoverItem[]> {
       type: 'advent',
       slug: day.slug,
       title: day.title.replace(/^Day \d+\s*-\s*/, ''),
-      category: `Day ${day.day} · ${day.category || 'DevOps'}`,
+      category: day.category || 'DevOps',
+      topicCategory: day.category,
+      tags: day.tags,
+      typeLabel: `Advent · Day ${day.day}`,
       directory: 'advent',
       ogSuffix: false,
     });
@@ -131,7 +164,8 @@ async function collectItems(): Promise<CoverItem[]> {
       type: 'game',
       slug: game.id,
       title: game.title,
-      category: game.category || game.type || 'Interactive',
+      category: game.category || 'Interactive',
+      typeLabel: game.type === 'game' ? 'Game' : 'Simulator',
       directory: 'games',
       ogSuffix: true,
     });
@@ -142,6 +176,7 @@ async function collectItems(): Promise<CoverItem[]> {
       slug: tool.slug,
       title: tool.title,
       category: CATEGORY_LABEL[tool.category],
+      topicCategory: tool.category,
       directory: 'tools',
       ogSuffix: false,
     });
@@ -152,7 +187,7 @@ async function collectItems(): Promise<CoverItem[]> {
       type: 'quiz',
       slug: required(quiz.id, 'quiz id'),
       title: required(quiz.title, 'quiz title'),
-      category: quiz.category || 'Quiz',
+      category: quiz.category || 'DevOps',
       directory: 'quizzes',
       ogSuffix: true,
     });
@@ -162,7 +197,9 @@ async function collectItems(): Promise<CoverItem[]> {
       type: 'checklist',
       slug: required(checklist.slug || checklist.id, 'checklist slug'),
       title: required(checklist.title, 'checklist title'),
-      category: checklist.category || 'Checklist',
+      category: checklist.category || 'DevOps',
+      topicCategory: checklist.category,
+      tags: checklist.tags,
       directory: 'checklists',
       ogSuffix: true,
     });
@@ -172,7 +209,9 @@ async function collectItems(): Promise<CoverItem[]> {
       type: 'interview',
       slug: required(question.slug || question.id, 'interview slug'),
       title: required(question.title, 'interview title'),
-      category: [question.category, question.difficulty].filter(Boolean).join(' · ') || 'Interview',
+      category: question.category || 'DevOps',
+      topicCategory: question.category,
+      tags: question.tags,
       directory: 'interview-questions',
       ogSuffix: true,
     });
@@ -185,7 +224,7 @@ async function collectItems(): Promise<CoverItem[]> {
         comparison.title || `${comparison.toolA?.name || ''} vs ${comparison.toolB?.name || ''}`,
         'comparison title'
       ),
-      category: comparison.category || 'Comparison',
+      category: comparison.category || 'DevOps',
       directory: 'comparisons',
       ogSuffix: true,
     });
@@ -195,7 +234,9 @@ async function collectItems(): Promise<CoverItem[]> {
       type: 'flashcard',
       slug: required(flashcard.id, 'flashcard id'),
       title: required(flashcard.title, 'flashcard title'),
-      category: flashcard.category || 'Flashcards',
+      category: flashcard.category || 'DevOps',
+      topicCategory: flashcard.category,
+      tags: flashcard.tags,
       directory: 'flashcards',
       ogSuffix: true,
     });
@@ -229,27 +270,41 @@ async function pathExists(filePath: string): Promise<boolean> {
   }
 }
 
-function assertRenderedTitleBounds(image: ReturnType<Resvg['render']>, item: CoverItem): void {
-  const layout = layoutContentCoverTitle(item.title, item.category);
+// Renders the overlay with the title in magenta and checks every line's
+// pixels stay inside the text column, clear of the illustration.
+function assertRenderedTitleBounds(item: CoverItem): void {
+  const typeLabel = coverTypeLabel(item.type, item.typeLabel);
+  const layout = layoutContentCoverTitle(item.title, item.category, typeLabel);
+  const svg = buildContentCoverSvg({ ...item, typeLabel: typeLabel ?? undefined }).replace(
+    /(<text data-cover-title-line="true"[^>]*fill=")#[^"]+("[^>]*>)/g,
+    '$1#ff00ff$2'
+  );
+  const image = renderCoverOverlay(svg);
+  if (image.width !== COVER_WIDTH || image.height !== COVER_HEIGHT) {
+    throw new Error(`Invalid cover dimensions for ${item.type}/${item.slug}`);
+  }
   const pixels = image.pixels;
   for (let lineIndex = 0; lineIndex < layout.lines.length; lineIndex += 1) {
     const baseline = layout.titleY + lineIndex * layout.lineHeight;
     const top = Math.max(0, Math.floor(baseline - layout.fontSize * 1.15));
-    const bottom = Math.min(image.height - 1, Math.ceil(baseline + 8));
-    let minX = image.width;
+    const bottom = Math.min(image.height - 1, Math.ceil(baseline + layout.fontSize * 0.3));
     let maxX = -1;
     for (let y = top; y <= bottom; y += 1) {
       for (let x = 0; x < image.width; x += 1) {
         const index = (y * image.width + x) * 4;
-        if (pixels[index] > 140 && pixels[index + 2] > 140 && pixels[index + 1] < 110) {
-          minX = Math.min(minX, x);
+        if (
+          pixels[index + 3] > 0 &&
+          pixels[index] > 140 &&
+          pixels[index + 2] > 140 &&
+          pixels[index + 1] < 110
+        ) {
           maxX = Math.max(maxX, x);
         }
       }
     }
-    if (maxX < minX)
+    if (maxX < 0)
       throw new Error(`Could not detect title line ${lineIndex + 1} for ${item.type}/${item.slug}`);
-    if (maxX - minX + 1 > layout.maxWidth + 2 || maxX > 80 + layout.maxWidth + 2) {
+    if (maxX > layout.titleX + layout.maxWidth + 2) {
       throw new Error(
         `Rendered title overflow on line ${lineIndex + 1} for ${item.type}/${item.slug}`
       );
@@ -257,57 +312,80 @@ function assertRenderedTitleBounds(image: ReturnType<Resvg['render']>, item: Cov
   }
 }
 
-async function writeCover(item: CoverItem): Promise<'generated' | 'skipped' | 'validated'> {
+function coverPaths(item: CoverItem) {
   const outputDirectory = path.join(root, 'public', 'images', item.directory);
   const baseName = `${item.slug}${item.ogSuffix ? '-og' : ''}`;
-  const svgPath = path.join(outputDirectory, `${baseName}.svg`);
-  const pngPath = path.join(outputDirectory, `${baseName}.png`);
-  // PNG is the deployed asset. Preserve any existing cover by default even
-  // when its intermediate SVG was pruned; --force is the explicit migration path.
-  if (!check && !force && (await pathExists(pngPath))) return 'skipped';
+  return {
+    outputDirectory,
+    baseName,
+    jpgPath: path.join(outputDirectory, `${baseName}.jpg`),
+    pngPath: path.join(outputDirectory, `${baseName}.png`),
+  };
+}
+
+// Served paths of PNG covers this run replaced; each gets a 301 to the JPEG
+// because sent newsletters and cross-posts still link the old URL.
+const replacedPngs: string[] = [];
+
+async function writeCover(item: CoverItem): Promise<'generated' | 'skipped' | 'validated'> {
+  const { outputDirectory, baseName, jpgPath, pngPath } = coverPaths(item);
+  if (check) {
+    assertRenderedTitleBounds(item);
+    return 'validated';
+  }
+  // Keep an existing cover, JPEG or older PNG, unless --force or --migrate
+  // asks for it; a new item gets one on the next run.
+  const hasJpg = await pathExists(jpgPath);
+  const hasPng = await pathExists(pngPath);
+  if (!force && (hasJpg || (hasPng && !migrate))) return 'skipped';
 
   await fs.mkdir(outputDirectory, { recursive: true });
-  const svg = buildContentCoverSvg({
+  const jpg = await renderContentCoverJpeg({
     type: item.type,
     title: item.title,
     category: item.category,
+    typeLabel: item.typeLabel,
+    background: selectCoverBackground({
+      type: item.type,
+      slug: item.slug,
+      category: item.topicCategory,
+      tags: item.tags,
+    }),
   });
-  if (/\{\{[^}]+\}\}/.test(svg))
-    throw new Error(`Unresolved SVG placeholder for ${item.type}/${item.slug}`);
 
-  const renderSvg = check
-    ? svg.replace(/(<text data-cover-title-line="true"[^>]*fill=")#[^"]+("[^>]*>)/g, '$1#ff00ff$2')
-    : svg;
-  const rendered = new Resvg(renderSvg, { fitTo: { mode: 'width', value: 1200 } }).render();
-  if (rendered.width !== 1200 || rendered.height !== 630) {
-    throw new Error(
-      `Invalid cover dimensions for ${item.type}/${item.slug}: ${rendered.width}x${rendered.height}`
-    );
-  }
-  if (check) {
-    assertRenderedTitleBounds(rendered, item);
-    const signature = [...rendered.asPng().subarray(0, 4)];
-    if (signature.join(',') !== '137,80,78,71')
-      throw new Error(`Invalid PNG for ${item.type}/${item.slug}`);
-    return 'validated';
-  }
-  const png = await sharp(rendered.asPng())
-    .resize(1200, 630, { fit: 'contain', background: '#08090c' })
-    .png({ quality: 90, compressionLevel: 9 })
-    .toBuffer();
-
-  const token = `${process.pid}-${Date.now()}`;
-  const temporarySvg = `${svgPath}.${token}.tmp`;
-  const temporaryPng = `${pngPath}.${token}.tmp`;
+  const temporaryJpg = `${jpgPath}.${process.pid}-${Date.now()}.tmp`;
   try {
-    await fs.writeFile(temporarySvg, svg, 'utf8');
-    await fs.writeFile(temporaryPng, png);
-    await fs.rename(temporarySvg, svgPath);
-    await fs.rename(temporaryPng, pngPath);
+    await fs.writeFile(temporaryJpg, jpg);
+    await fs.rename(temporaryJpg, jpgPath);
   } finally {
-    await Promise.all([fs.rm(temporarySvg, { force: true }), fs.rm(temporaryPng, { force: true })]);
+    await fs.rm(temporaryJpg, { force: true });
   }
+  // Older covers for the same item were PNG (rendered from an SVG). The JPEG
+  // replaces both, so they should not ship alongside it.
+  await Promise.all(
+    ['png', 'svg'].map((extension) =>
+      fs.rm(path.join(outputDirectory, `${baseName}.${extension}`), { force: true })
+    )
+  );
+  if (hasPng) replacedPngs.push(`/images/${item.directory}/${baseName}.png`);
   return 'generated';
+}
+
+async function addPngRedirects(): Promise<number> {
+  if (replacedPngs.length === 0) return 0;
+  const redirectsPath = path.join(root, 'public', '_redirects');
+  const current = await fs.readFile(redirectsPath, 'utf8');
+  const existing = new Set(current.split('\n').map((line) => line.split(/\s+/)[0]));
+  const header = '# Content covers moved from PNG to JPEG (Oct 2026)';
+  const lines = [...new Set(replacedPngs)]
+    .filter((from) => !existing.has(from))
+    .sort()
+    .map((from) => `${from} ${from.replace(/\.png$/, '.jpg')} 301`);
+  if (lines.length === 0) return 0;
+  const prefix = current.endsWith('\n') ? '' : '\n';
+  const block = current.includes(header) ? lines : [header, ...lines];
+  await fs.appendFile(redirectsPath, `${prefix}${block.join('\n')}\n`);
+  return lines.length;
 }
 
 async function main(): Promise<void> {
@@ -326,17 +404,18 @@ async function main(): Promise<void> {
   let generated = 0;
   let skipped = 0;
   let validated = 0;
-  for (let index = 0; index < items.length; index += 10) {
-    const batch = items.slice(index, index + 10);
+  for (let index = 0; index < items.length && generated < limit; index += workers) {
+    const batch = items.slice(index, index + Math.min(workers, limit - generated));
     const results = await Promise.all(batch.map(writeCover));
     generated += results.filter((result) => result === 'generated').length;
     skipped += results.filter((result) => result === 'skipped').length;
     validated += results.filter((result) => result === 'validated').length;
   }
+  const redirects = await addPngRedirects();
 
   console.log(`Content cover inventory: ${inventory}.`);
   console.log(
-    `Content covers: ${generated} generated, ${skipped} skipped, ${validated} validated, ${items.length} selected (${allItems.length} total).`
+    `Content covers: ${generated} generated, ${skipped} skipped, ${validated} validated, ${items.length} selected (${allItems.length} total), ${redirects} PNG redirects added.`
   );
 }
 
